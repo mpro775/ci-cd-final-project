@@ -1,0 +1,119 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: counter-service-pipeline
+spec:
+  params:
+    - name: repo-url
+      type: string
+      description: GitHub repository URL
+
+    - name: revision
+      type: string
+      default: main
+
+    - name: image-name
+      type: string
+      description: Full OpenShift internal registry image name
+
+  workspaces:
+    - name: shared-workspace
+
+  tasks:
+
+    - name: cleanup
+      taskRef:
+        name: cleanup
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: clone
+      runAfter:
+        - cleanup
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+        - name: deleteExisting
+          value: "true"
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+
+    - name: lint
+      runAfter:
+        - clone
+      taskRef:
+        name: eslint
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: test
+      runAfter:
+        - lint
+      taskRef:
+        name: jest-test
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: build
+      runAfter:
+        - test
+      taskRef:
+        name: buildah
+        kind: ClusterTask
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+        - name: DOCKERFILE
+          value: ./Dockerfile
+        - name: CONTEXT
+          value: .
+        - name: TLSVERIFY
+          value: "false"
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: deploy
+      runAfter:
+        - build
+      taskRef:
+        name: openshift-client
+        kind: ClusterTask
+      params:
+        - name: SCRIPT
+          value: |
+            echo "Deploying counter-service..."
+
+            oc create deployment counter-service \
+              --image=$(params.image-name) \
+              --dry-run=client -o yaml | oc apply -f -
+
+            oc set image deployment/counter-service \
+              counter-service=$(params.image-name)
+
+            oc set env deployment/counter-service PORT=8000
+
+            oc create service clusterip counter-service \
+              --tcp=8000:8000 \
+              --dry-run=client -o yaml | oc apply -f -
+
+            if ! oc get route counter-service >/dev/null 2>&1; then
+              oc expose service counter-service
+            fi
+
+            oc rollout status deployment/counter-service --timeout=180s
+
+            echo "Application route:"
+            oc get route counter-service
+      workspaces:
+        - name: manifest-dir
+          workspace: shared-workspace
